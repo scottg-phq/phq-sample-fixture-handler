@@ -1,0 +1,10 @@
+{
+  "name": "phq-sample-fixture-handler",
+  "version": "1.0.0",
+  "description": "A simplified mock implementation of PlayHQ's fixture upload system for interview purposes.",
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^24.3.0"
+  }
+}
