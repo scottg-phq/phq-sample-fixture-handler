@@ -1,62 +1,68 @@
-import { ValidationRepositories, S3Adapter } from './interview-repository-layer'
+import { FixtureRepositories, S3Adapter } from './repository'
+import { 
+  FixtureUploadCommand, 
+  BulkFixtureUpload, 
+  ResultMap, 
+  RoundParam,
+  ValidationError,
+  FixtureRow,
+  ValidationContext
+} from './types'
 
 /**
- * SIMPLIFIED VALIDATION SERVICE - INTERVIEW VERSION
+ * FIXTURE UPLOAD HANDLER - INTERVIEW VERSION
  *
- * This captures the validation complexity patterns from the real implementation:
- * - File format validation (Excel parsing)
- * - Business rule validation with database lookups
- * - Multi-level validation hierarchy (file -> template -> business rules)
- * - Big O complexity analysis for each validation type
- * - Error aggregation and user-friendly messaging
+ * This captures the key complexity patterns and database operations from the real implementation:
+ * - Complexity scales with number of grades, rounds, and teams
+ * - S3 operations for file validation and storage
+ * - Multiple repository calls with different query patterns
+ * - Validation logic and error handling
+ * - Event generation for downstream services
  */
 
-interface ValidationError {
-  type: 'FILE_FORMAT' | 'BUSINESS_RULE' | 'DATA_INTEGRITY'
-  message: string
-  row?: number
-  column?: string
-  gradeID?: string
-}
+// MAIN HANDLER - Orchestrates the entire fixture upload process
+export class FixtureUploadHandler {
+  constructor(
+    private s3Adapter: S3Adapter,
+    private repositories: FixtureRepositories,
+  ) {}
 
-interface FixtureRow {
-  gradeCode: string
-  homeTeam: string
-  awayTeam: string
-  date: string
-  round: number
-  gameType?: string
-}
+  // Each grade triggers: validation, persistence, event generation
+  async handle(command: FixtureUploadCommand): Promise<{ result: BulkFixtureUpload; events: any[] }> {
+    const events: any[] = []
 
-interface Grade {
-  id: string
-  code: string
-  seasonID: string
-  noOfRounds: number
-}
+    try {
+      // STEP 1: S3 file validation
+      const { fileBuffer, validationErrors } = await this.validateS3File(command)
 
-interface Team {
-  id: string
-  name: string
-  gradeID: string
-}
+      if (validationErrors?.length) {
+        return { result: { errors: validationErrors, fixture: null }, events: [] }
+      }
 
-interface ValidationContext {
-  seasonID: string
-  grades: Grade[]
-  teams: Team[]
-  existingFixtures: { [gradeID: string]: boolean }
-}
+      // STEP 2: Process fixture upload
+      const uploadResult = await this.processFixtureUpload(fileBuffer!, command.seasonID)
 
-// MAIN VALIDATION SERVICE - Orchestrates all validation types
-export class FixtureValidationService {
-  constructor(private repositories: ValidationRepositories) {}
+      // STEP 3: Generate events for downstream systems
+      events.push(...this.generateEvents(uploadResult))
+
+      return {
+        result: { errors: null, fixture: null },
+        events,
+      }
+    } catch (error) {
+      throw new Error('Fixture upload failed')
+    }
+  }
+
+  // =============================================================================
+  // VALIDATION METHODS - File format and business rule validation
+  // =============================================================================
 
   // Validates Excel file format and business rules
-  async validateS3File(command: { seasonID: string; objectKey: string }, s3Adapter: S3Adapter) {
+  private async validateS3File(command: { seasonID: string; objectKey: string }) {
     try {
       // STEP 1: S3 file retrieval
-      const fileBuffer = await s3Adapter.getObject('upload-bucket', command.objectKey)
+      const fileBuffer = await this.s3Adapter.getObject('upload-bucket', command.objectKey)
 
       // STEP 2: File format validation
       const parseResult = await this.parseAndValidateFile(fileBuffer)
@@ -101,7 +107,7 @@ export class FixtureValidationService {
       // Simulate Excel parsing - real implementation uses xlsx library
       const mockExcelData = this.simulateExcelParsing(fileBuffer)
 
-      // VALIDATION LOOP
+      // VALIDATION LOOP - This is where O(n) complexity starts
       mockExcelData.forEach((row, index) => {
         const rowNumber = index + 2 // Excel rows start at 2 (header at 1)
 
@@ -196,7 +202,7 @@ export class FixtureValidationService {
     // STEP 1: Load validation context
     const context = await this.loadValidationContext(seasonID, fixtureRows)
 
-    // STEP 2: Validate each fixture row
+    // STEP 2: Validate each fixture row - POTENTIAL O(n²) ISSUE HERE!
     for (const row of fixtureRows) {
       errors.push(...(await this.validateFixtureRow(row, context)))
     }
@@ -215,7 +221,7 @@ export class FixtureValidationService {
     const [grades, teams, existingFixtures] = await Promise.all([
       this.repositories.gradeRepo.findBySeasonIDAndCodes(seasonID, uniqueGradeCodes),
       this.repositories.teamRepo.findBySeasonID(seasonID),
-      this.repositories.gradeRepo.hasFixtures(uniqueGradeCodes),
+      this.repositories.gradeRepo.hasFixturesByCode(uniqueGradeCodes),
     ])
 
     return {
@@ -226,11 +232,11 @@ export class FixtureValidationService {
     }
   }
 
-  // SINGLE ROW VALIDATION
+  // SINGLE ROW VALIDATION - Contains O(n) lookups that could be optimized
   private async validateFixtureRow(row: FixtureRow, context: ValidationContext): Promise<ValidationError[]> {
     const errors: ValidationError[] = []
 
-    // Grade existence validation
+    // Grade existence validation - O(n) lookup in grades array
     const grade = context.grades.find(g => g.code === row.gradeCode)
     if (!grade) {
       errors.push({
@@ -241,7 +247,7 @@ export class FixtureValidationService {
       return errors // Can't validate further without valid grade
     }
 
-    // Team existence validation
+    // Team existence validation - O(n) lookups in teams array
     const gradeTeams = context.teams.filter(t => t.gradeID === grade.id)
     const homeTeam = gradeTeams.find(t => t.name === row.homeTeam)
     const awayTeam = gradeTeams.find(t => t.name === row.awayTeam)
@@ -333,7 +339,106 @@ export class FixtureValidationService {
     return errors
   }
 
+  // =============================================================================
+  // PROCESSING METHODS - Core business logic
+  // =============================================================================
+
+  // CORE PROCESSING LOGIC
+  private async processFixtureUpload(fileBuffer: Buffer, seasonID: string) {
+    // Parse Excel file
+    const roundsParams = await this.parseFixtureFile(fileBuffer, seasonID)
+    const gradeIDs = Object.keys(roundsParams)
+
+    // PARALLEL DATABASE QUERIES - Run concurrently for performance
+    const [hasFixtureByGradeIDs, gamesByGradeIDs, competition] = await Promise.all([
+      this.repositories.gradeRepo.hasFixtures(gradeIDs), // CHECK existence
+      this.repositories.gameRepo.findByGradeIDs(gradeIDs), // FETCH existing games
+      this.repositories.competitionRepo.findBySeasonID(seasonID), // FETCH competition
+    ])
+
+    // Calculate grade attributes
+    const gradeAttributes = await this.calculateGradeAttributes(roundsParams)
+
+    // PERSISTENCE - Most expensive operation
+    const persistResult = await this.repositories.persistService.persist(
+      roundsParams,
+      competition?.type || 'DOMESTIC',
+      gradeAttributes,
+    )
+
+    return {
+      gradeIDs: persistResult.gradeIDs,
+      teamIDs: persistResult.teamIDs,
+      newGameIDs: persistResult.gameIDs,
+      existingGames: Object.values(gamesByGradeIDs).flat(),
+      hasFixtureByGradeIDs,
+    }
+  }
+
+  // File parsing
+  private async parseFixtureFile(fileBuffer: Buffer, seasonID: string): Promise<{ [gradeID: string]: RoundParam[] }> {
+    // Simulate Excel parsing complexity
+    return {} // Simplified - real version parses Excel workbook
+  }
+
+  // Grade attribute calculation
+  private async calculateGradeAttributes(roundsParams: { [gradeID: string]: RoundParam[] }) {
+    const gradeIDs = Object.keys(roundsParams)
+    // Fetch existing rounds to calculate totals
+    const allRoundsByGrade = await this.repositories.roundRepo.findByGradeIDs(gradeIDs)
+
+    return gradeIDs.reduce((acc, gradeID) => {
+      const existingRounds = allRoundsByGrade[gradeID] || []
+      const suppliedRounds = roundsParams[gradeID]
+      const totalRoundsCount = existingRounds.length + suppliedRounds.length
+      const firstDate = existingRounds[0]?.provisionalDate || suppliedRounds[0]?.round?.provisionalDate
+
+      acc[gradeID] = {
+        noOfRounds: totalRoundsCount,
+        startDate: firstDate,
+      }
+      return acc
+    }, {} as any)
+  }
+
+  // =============================================================================
+  // EVENT GENERATION METHODS
+  // =============================================================================
+
+  // Event generation
+  private generateEvents(uploadResult: any) {
+    const events: any[] = []
+
+    // Ladder recalculation events
+    events.push(...uploadResult.gradeIDs.map(id => ({ type: 'CalculateLadder', gradeID: id })))
+
+    // Game allocation events
+    if (uploadResult.existingGames.length > 0) {
+      events.push({ type: 'GamesAllocated', games: uploadResult.existingGames })
+    }
+
+    if (uploadResult.newGameIDs.length > 0) {
+      events.push({ type: 'GamesAllocationCreated', gameIDs: uploadResult.newGameIDs })
+    }
+
+    // Team and fixture webhook events
+    events.push({ type: 'TeamUpdated', teamIDs: uploadResult.teamIDs })
+    events.push(...this.getFixtureWebhookEvents(uploadResult.gradeIDs, uploadResult.hasFixtureByGradeIDs))
+
+    return events
+  }
+
+  private getFixtureWebhookEvents(gradeIDs: string[], hasFixtureByGradeIDs: ResultMap<boolean>) {
+    return gradeIDs.map(gradeID => ({
+      type: hasFixtureByGradeIDs[gradeID] ? 'FixtureUpdated' : 'FixtureCreated',
+      gradeID,
+    }))
+  }
+
+  // =============================================================================
   // HELPER METHODS
+  // =============================================================================
+
   private simulateExcelParsing(fileBuffer: Buffer): any[] {
     // Simulate parsing Excel file - real implementation uses xlsx library
     return [
