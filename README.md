@@ -27,4 +27,10 @@ Processes CSV files containing sports fixture data, validates content, and persi
 
 **Your task: What changes would you make to achieve this outcome?**
 
-Consider all aspects of the system that would be impacted by this change and propose your solution.
+Please provide solutions at two levels:
+
+1. **Short-term (Quick Win)**: What immediate changes could you make to handle the increased load with minimal code changes? Focus on quick fixes that could be implemented and deployed quickly.
+
+2. **Medium Effort Solution**: What more substantial improvements would you recommend for better long-term scalability and performance? Consider architectural changes, optimization strategies, and system design improvements.
+
+Consider all aspects of the system that would be impacted by this change and explain your reasoning for each solution.
